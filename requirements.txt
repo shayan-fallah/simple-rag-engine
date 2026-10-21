@@ -1,7 +1,7 @@
-pandas
-openai
-psycopg
-python-dotenv
-timescale-vector
-instructor
-anthropic
+pandas>=2.2
+openai>=3.0
+anthropic>=1.0
+psycopg[binary]>=3.3
+pgvector>=0.5
+python-dotenv>=1.0
+pydantic>=2.0

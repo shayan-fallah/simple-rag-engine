@@ -1,5 +1,7 @@
-from typing import List
+from typing import List, Optional
+
 import pandas as pd
+from config.settings import get_settings
 from pydantic import BaseModel, Field
 from services.llm_factory import LLMFactory
 
@@ -17,29 +19,30 @@ class SynthesizedResponse(BaseModel):
 class Synthesizer:
     SYSTEM_PROMPT = """
     # Role and Purpose
-    You are an AI assistant for an e-commerce FAQ system. Your task is to synthesize a coherent and helpful answer 
+    You are an AI assistant for an e-commerce FAQ system. Your task is to synthesize a coherent and helpful answer
     based on the given question and relevant context retrieved from a knowledge database.
 
     # Guidelines:
     1. Provide a clear and concise answer to the question.
     2. Use only the information from the relevant context to support your answer.
-    3. The context is retrieved based on cosine similarity, so some information might be missing or irrelevant.
+    3. The context is retrieved by similarity search, so some information might be missing or irrelevant.
     4. Be transparent when there is insufficient information to fully answer the question.
     5. Do not make up or infer information not present in the provided context.
     6. If you cannot answer the question based on the given context, clearly state that.
     7. Maintain a helpful and professional tone appropriate for customer service.
     8. Adhere strictly to company guidelines and policies by using only the provided knowledge base.
-    
-    Review the question from the user:
     """
 
     @staticmethod
-    def generate_response(question: str, context: pd.DataFrame) -> SynthesizedResponse:
+    def generate_response(
+        question: str, context: pd.DataFrame, provider: Optional[str] = None
+    ) -> SynthesizedResponse:
         """Generates a synthesized response based on the question and context.
 
         Args:
             question: The user's question.
             context: The relevant context retrieved from the knowledge base.
+            provider: "openai" or "anthropic". Defaults to the LLM_PROVIDER setting.
 
         Returns:
             A SynthesizedResponse containing thought process and answer.
@@ -50,14 +53,13 @@ class Synthesizer:
 
         messages = [
             {"role": "system", "content": Synthesizer.SYSTEM_PROMPT},
-            {"role": "user", "content": f"# User question:\n{question}"},
             {
-                "role": "assistant",
-                "content": f"# Retrieved information:\n{context_str}",
+                "role": "user",
+                "content": f"# Retrieved information:\n{context_str}\n\n# User question:\n{question}",
             },
         ]
 
-        llm = LLMFactory("openai")
+        llm = LLMFactory(provider or get_settings().llm_provider)
         return llm.create_completion(
             response_model=SynthesizedResponse,
             messages=messages,
@@ -78,4 +80,5 @@ class Synthesizer:
         Returns:
             str: A JSON string representation of the selected columns.
         """
-        return context[columns_to_keep].to_json(orient="records", indent=2)
+        columns = [c for c in columns_to_keep if c in context.columns]
+        return context[columns].to_json(orient="records", indent=2)

@@ -2,7 +2,8 @@ name: timescaledb
 
 services:
   timescaledb:
-    image: timescale/timescaledb-ha:pg16
+    # Postgres 18 with pgvector, pgvectorscale and pg_textsearch (BM25) included
+    image: timescale/timescaledb-ha:pg18
     container_name: timescaledb
     environment:
       - POSTGRES_DB=postgres
@@ -10,8 +11,9 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - timescaledb_data:/var/lib/postgresql/data
+      # This image keeps its data in /home/postgres/pgdata/data
+      - pgdata_pg18:/home/postgres/pgdata
     restart: unless-stopped
 
 volumes:
-  timescaledb_data:
+  pgdata_pg18:

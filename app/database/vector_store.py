@@ -1,65 +1,153 @@
 import logging
 import time
-from typing import Any, List, Optional, Tuple, Union
 from datetime import datetime
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
+import numpy as np
 import pandas as pd
+import psycopg
 from config.settings import get_settings
+from database.filters import Predicate
+from database.uuid7 import uuid7_lower_bound
 from openai import OpenAI
-from timescale_vector import client
+from pgvector.psycopg import register_vector
+from psycopg import sql
+from psycopg.types.json import Jsonb
 
 
 class VectorStore:
-    """A class for managing vector operations and database interactions."""
+    """A class for managing vector operations and database interactions.
+
+    Talks to Postgres directly with psycopg + pgvector. Uses:
+      - pgvector for the `vector` type and the `<=>` cosine distance operator
+      - pgvectorscale for the StreamingDiskANN index (with label filtering)
+      - pg_textsearch for BM25 keyword search (used by hybrid_search)
+    """
 
     def __init__(self):
-        """Initialize the VectorStore with settings, OpenAI client, and Timescale Vector client."""
+        """Initialize the VectorStore with settings and an OpenAI client."""
         self.settings = get_settings()
         self.openai_client = OpenAI(api_key=self.settings.openai.api_key)
         self.embedding_model = self.settings.openai.embedding_model
         self.vector_settings = self.settings.vector_store
-        self.vec_client = client.Sync(
-            self.settings.database.service_url,
-            self.vector_settings.table_name,
-            self.vector_settings.embedding_dimensions,
-            time_partition_interval=self.vector_settings.time_partition_interval,
-        )
+        self.table_name = self.vector_settings.table_name
+        self._table = sql.Identifier(self.table_name)
+        self._labels_table = sql.Identifier(f"{self.table_name}_labels")
+        self._vector_index = sql.Identifier(f"{self.table_name}_embedding_idx")
+        self._keyword_index = sql.Identifier(f"{self.table_name}_contents_bm25_idx")
+        self._conn: Optional[psycopg.Connection] = None
 
-    def get_embedding(self, text: str) -> List[float]:
-        """
-        Generate embedding for the given text.
+    @property
+    def conn(self) -> psycopg.Connection:
+        """A lazily opened connection with the pgvector types registered."""
+        if self._conn is None or self._conn.closed:
+            conn = psycopg.connect(self.settings.database.service_url, autocommit=True)
+            # CASCADE also installs pgvector, which pgvectorscale builds on.
+            conn.execute("CREATE EXTENSION IF NOT EXISTS vectorscale CASCADE")
+            register_vector(conn)
+            self._conn = conn
+        return self._conn
 
-        Args:
-            text: The input text to generate an embedding for.
+    def close(self) -> None:
+        if self._conn is not None:
+            self._conn.close()
 
-        Returns:
-            A list of floats representing the embedding.
-        """
-        text = text.replace("\n", " ")
+    # ------------------------------------------------------------------
+    # Embeddings
+    # ------------------------------------------------------------------
+
+    def get_embeddings(self, texts: List[str], batch_size: int = 100) -> List[List[float]]:
+        """Generate embeddings for many texts, sending them to OpenAI in batches."""
         start_time = time.time()
-        embedding = (
-            self.openai_client.embeddings.create(
-                input=[text],
+        embeddings: List[List[float]] = []
+        for i in range(0, len(texts), batch_size):
+            response = self.openai_client.embeddings.create(
+                input=texts[i : i + batch_size],
                 model=self.embedding_model,
             )
-            .data[0]
-            .embedding
-        )
+            embeddings.extend(item.embedding for item in response.data)
         elapsed_time = time.time() - start_time
-        logging.info(f"Embedding generated in {elapsed_time:.3f} seconds")
-        return embedding
+        logging.info(f"{len(texts)} embedding(s) generated in {elapsed_time:.3f} seconds")
+        return embeddings
+
+    def get_embedding(self, text: str) -> List[float]:
+        """Generate the embedding for a single text."""
+        return self.get_embeddings([text])[0]
+
+    # ------------------------------------------------------------------
+    # Schema
+    # ------------------------------------------------------------------
 
     def create_tables(self) -> None:
-        """Create the necessary tablesin the database"""
-        self.vec_client.create_tables()
+        """Create the embeddings table and the label lookup table."""
+        with self.conn.transaction():
+            self.conn.execute(
+                sql.SQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS {table} (
+                        id uuid PRIMARY KEY DEFAULT uuidv7(),
+                        metadata jsonb NOT NULL DEFAULT '{{}}',
+                        contents text NOT NULL,
+                        embedding vector({dims}) NOT NULL,
+                        labels smallint[] NOT NULL DEFAULT '{{}}'
+                    )
+                    """
+                ).format(
+                    table=self._table,
+                    dims=sql.Literal(self.vector_settings.embedding_dimensions),
+                )
+            )
+            # DiskANN labels are small integers; this maps them to names.
+            self.conn.execute(
+                sql.SQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS {labels} (
+                        id smallint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                        name text NOT NULL UNIQUE
+                    )
+                    """
+                ).format(labels=self._labels_table)
+            )
 
     def create_index(self) -> None:
-        """Create the StreamingDiskANN index to spseed up similarity search"""
-        self.vec_client.create_embedding_index(client.DiskAnnIndex())
+        """Create the StreamingDiskANN vector index and the BM25 keyword index."""
+        # Including `labels` lets DiskANN filter by label during the graph search.
+        self.conn.execute(
+            sql.SQL(
+                "CREATE INDEX IF NOT EXISTS {index} ON {table} "
+                "USING diskann (embedding vector_cosine_ops, labels)"
+            ).format(index=self._vector_index, table=self._table)
+        )
+        if self._enable_keyword_search():
+            self.conn.execute(
+                sql.SQL(
+                    "CREATE INDEX IF NOT EXISTS {index} ON {table} "
+                    "USING bm25 (contents) WITH (text_config = {config})"
+                ).format(
+                    index=self._keyword_index,
+                    table=self._table,
+                    config=sql.Literal(self.vector_settings.text_search_config),
+                )
+            )
 
     def drop_index(self) -> None:
-        """Drop the StreamingDiskANN index in the database"""
-        self.vec_client.drop_embedding_index()
+        """Drop the vector and keyword indexes."""
+        for index in (self._vector_index, self._keyword_index):
+            self.conn.execute(sql.SQL("DROP INDEX IF EXISTS {}").format(index))
+
+    def _enable_keyword_search(self) -> bool:
+        try:
+            self.conn.execute("CREATE EXTENSION IF NOT EXISTS pg_textsearch")
+            return True
+        except psycopg.Error as e:
+            logging.warning(
+                f"pg_textsearch is not available, so hybrid_search() won't work: {e}"
+            )
+            return False
+
+    # ------------------------------------------------------------------
+    # Writes
+    # ------------------------------------------------------------------
 
     def upsert(self, df: pd.DataFrame) -> None:
         """
@@ -67,117 +155,38 @@ class VectorStore:
 
         Args:
             df: A pandas DataFrame containing the data to insert or update.
-                Expected columns: id, metadata, contents, embedding
+                Expected columns: id, metadata, contents, embedding.
+                `id` may be None, in which case Postgres generates a UUIDv7.
         """
-        records = df.to_records(index=False)
-        self.vec_client.upsert(list(records))
-        logging.info(
-            f"Inserted {len(df)} records into {self.vector_settings.table_name}"
-        )
+        label_key = self.vector_settings.label_key
+        names = {n for metadata in df["metadata"] for n in _as_list(metadata.get(label_key))}
+        label_ids = self._get_label_ids(names, create=True)
 
-    def search(
-        self,
-        query_text: str,
-        limit: int = 5,
-        metadata_filter: Union[dict, List[dict]] = None,
-        predicates: Optional[client.Predicates] = None,
-        time_range: Optional[Tuple[datetime, datetime]] = None,
-        return_dataframe: bool = True,
-    ) -> Union[List[Tuple[Any, ...]], pd.DataFrame]:
-        """
-        Query the vector database for similar embeddings based on input text.
+        rows = [
+            (
+                record.id,
+                Jsonb(record.metadata),
+                record.contents,
+                np.asarray(record.embedding, dtype=np.float32),
+                [label_ids[n] for n in _as_list(record.metadata.get(label_key))],
+            )
+            for record in df.itertuples(index=False)
+        ]
+        query = sql.SQL(
+            """
+            INSERT INTO {table} (id, metadata, contents, embedding, labels)
+            VALUES (COALESCE(%s::uuid, uuidv7()), %s, %s, %s, %s::smallint[])
+            ON CONFLICT (id) DO UPDATE SET
+                metadata = EXCLUDED.metadata,
+                contents = EXCLUDED.contents,
+                embedding = EXCLUDED.embedding,
+                labels = EXCLUDED.labels
+            """
+        ).format(table=self._table)
 
-        More info:
-            https://github.com/timescale/docs/blob/latest/ai/python-interface-for-pgvector-and-timescale-vector.md
-
-        Args:
-            query_text: The input text to search for.
-            limit: The maximum number of results to return.
-            metadata_filter: A dictionary or list of dictionaries for equality-based metadata filtering.
-            predicates: A Predicates object for complex metadata filtering.
-                - Predicates objects are defined by the name of the metadata key, an operator, and a value.
-                - Operators: ==, !=, >, >=, <, <=
-                - & is used to combine multiple predicates with AND operator.
-                - | is used to combine multiple predicates with OR operator.
-            time_range: A tuple of (start_date, end_date) to filter results by time.
-            return_dataframe: Whether to return results as a DataFrame (default: True).
-
-        Returns:
-            Either a list of tuples or a pandas DataFrame containing the search results.
-
-        Basic Examples:
-            Basic search:
-                vector_store.search("What are your shipping options?")
-            Search with metadata filter:
-                vector_store.search("Shipping options", metadata_filter={"category": "Shipping"})
-        
-        Predicates Examples:
-            Search with predicates:
-                vector_store.search("Pricing", predicates=client.Predicates("price", ">", 100))
-            Search with complex combined predicates:
-                complex_pred = (client.Predicates("category", "==", "Electronics") & client.Predicates("price", "<", 1000)) | \
-                               (client.Predicates("category", "==", "Books") & client.Predicates("rating", ">=", 4.5))
-                vector_store.search("High-quality products", predicates=complex_pred)
-        
-        Time-based filtering:
-            Search with time range:
-                vector_store.search("Recent updates", time_range=(datetime(2024, 1, 1), datetime(2024, 1, 31)))
-        """
-        query_embedding = self.get_embedding(query_text)
-
-        start_time = time.time()
-
-        search_args = {
-            "limit": limit,
-        }
-
-        if metadata_filter:
-            search_args["filter"] = metadata_filter
-
-        if predicates:
-            search_args["predicates"] = predicates
-
-        if time_range:
-            start_date, end_date = time_range
-            search_args["uuid_time_filter"] = client.UUIDTimeRange(start_date, end_date)
-
-        results = self.vec_client.search(query_embedding, **search_args)
-        elapsed_time = time.time() - start_time
-
-        logging.info(f"Vector search completed in {elapsed_time:.3f} seconds")
-
-        if return_dataframe:
-            return self._create_dataframe_from_results(results)
-        else:
-            return results
-
-    def _create_dataframe_from_results(
-        self,
-        results: List[Tuple[Any, ...]],
-    ) -> pd.DataFrame:
-        """
-        Create a pandas DataFrame from the search results.
-
-        Args:
-            results: A list of tuples containing the search results.
-
-        Returns:
-            A pandas DataFrame containing the formatted search results.
-        """
-        # Convert results to DataFrame
-        df = pd.DataFrame(
-            results, columns=["id", "metadata", "content", "embedding", "distance"]
-        )
-
-        # Expand metadata column
-        df = pd.concat(
-            [df.drop(["metadata"], axis=1), df["metadata"].apply(pd.Series)], axis=1
-        )
-
-        # Convert id to string for better readability
-        df["id"] = df["id"].astype(str)
-
-        return df
+        with self.conn.transaction(), self.conn.cursor() as cur:
+            cur.executemany(query, rows)
+        logging.info(f"Inserted {len(df)} records into {self.table_name}")
 
     def delete(
         self,
@@ -197,7 +206,7 @@ class VectorStore:
 
         Examples:
             Delete by IDs:
-                vector_store.delete(ids=["8ab544ae-766a-11ef-81cb-decf757b836d"])
+                vector_store.delete(ids=["01a15e9f-1d6c-7023-a2f1-9122651028db"])
 
             Delete by metadata filter:
                 vector_store.delete(metadata_filter={"category": "Shipping"})
@@ -211,15 +220,284 @@ class VectorStore:
             )
 
         if delete_all:
-            self.vec_client.delete_all()
-            logging.info(f"Deleted all records from {self.vector_settings.table_name}")
+            self.conn.execute(sql.SQL("TRUNCATE {}").format(self._table))
+            logging.info(f"Deleted all records from {self.table_name}")
         elif ids:
-            self.vec_client.delete_by_ids(ids)
-            logging.info(
-                f"Deleted {len(ids)} records from {self.vector_settings.table_name}"
+            cur = self.conn.execute(
+                sql.SQL("DELETE FROM {} WHERE id = ANY(%s::uuid[])").format(self._table),
+                [list(ids)],
             )
+            logging.info(f"Deleted {cur.rowcount} records from {self.table_name}")
         elif metadata_filter:
-            self.vec_client.delete_by_metadata(metadata_filter)
-            logging.info(
-                f"Deleted records matching metadata filter from {self.vector_settings.table_name}"
+            cur = self.conn.execute(
+                sql.SQL("DELETE FROM {} WHERE metadata @> %s").format(self._table),
+                [Jsonb(metadata_filter)],
             )
+            logging.info(
+                f"Deleted {cur.rowcount} records matching metadata filter from {self.table_name}"
+            )
+
+    # ------------------------------------------------------------------
+    # Search
+    # ------------------------------------------------------------------
+
+    def search(
+        self,
+        query_text: str,
+        limit: int = 5,
+        metadata_filter: Union[dict, List[dict]] = None,
+        predicates: Optional[Predicate] = None,
+        labels: Union[str, List[str], None] = None,
+        time_range: Optional[Tuple[datetime, datetime]] = None,
+        return_dataframe: bool = True,
+    ) -> Union[List[Tuple[Any, ...]], pd.DataFrame]:
+        """
+        Query the vector database for similar embeddings based on input text.
+
+        Args:
+            query_text: The input text to search for.
+            limit: The maximum number of results to return.
+            metadata_filter: A dictionary (or list of dictionaries, matched with OR)
+                for equality-based metadata filtering, using jsonb containment (@>).
+            predicates: A Predicate object for complex metadata filtering.
+                - Predicates are defined by the name of the metadata key, an operator, and a value.
+                - Operators: ==, !=, >, >=, <, <=
+                - & is used to combine multiple predicates with AND operator.
+                - | is used to combine multiple predicates with OR operator.
+            labels: One or more values of the label key (default: "category").
+                This filter runs inside the DiskANN index, so it's the fastest
+                way to filter. Multiple labels match with OR.
+            time_range: A tuple of (start_date, end_date) to filter results by the
+                time stored in the UUIDv7 id. Start is inclusive, end is exclusive.
+            return_dataframe: Whether to return results as a DataFrame (default: True).
+
+        Returns:
+            Either a list of tuples or a pandas DataFrame containing the search results.
+            Columns: id, content, distance, plus one column per metadata key.
+
+        Basic Examples:
+            Basic search:
+                vector_store.search("What are your shipping options?")
+            Search with metadata filter:
+                vector_store.search("Shipping options", metadata_filter={"category": "Shipping"})
+            Search with label filter (fastest):
+                vector_store.search("Shipping options", labels=["Shipping"])
+
+        Predicates Examples:
+            Search with predicates:
+                vector_store.search("Pricing", predicates=Predicate("price", ">", 100))
+            Search with complex combined predicates:
+                complex_pred = (Predicate("category", "==", "Electronics") & Predicate("price", "<", 1000)) | \
+                               (Predicate("category", "==", "Books") & Predicate("rating", ">=", 4.5))
+                vector_store.search("High-quality products", predicates=complex_pred)
+
+        Time-based filtering:
+            Search with time range:
+                vector_store.search("Recent updates", time_range=(datetime(2026, 1, 1), datetime(2026, 2, 1)))
+        """
+        columns = ["id", "metadata", "content", "distance"]
+        query_embedding = np.asarray(self.get_embedding(query_text), dtype=np.float32)
+
+        start_time = time.time()
+        where = self._where_clause(metadata_filter, predicates, labels, time_range)
+        if where is None:
+            rows = []
+        else:
+            where_sql, where_params = where
+            query = sql.SQL(
+                """
+                SELECT id, metadata, contents, embedding <=> %s AS distance
+                FROM {table}
+                {where}
+                ORDER BY embedding <=> %s
+                LIMIT %s
+                """
+            ).format(table=self._table, where=where_sql)
+            params = [query_embedding, *where_params, query_embedding, limit]
+            rows = self.conn.execute(query, params).fetchall()
+        elapsed_time = time.time() - start_time
+
+        logging.info(f"Vector search completed in {elapsed_time:.3f} seconds")
+
+        if return_dataframe:
+            return self._create_dataframe_from_results(rows, columns)
+        return rows
+
+    def hybrid_search(
+        self,
+        query_text: str,
+        limit: int = 5,
+        metadata_filter: Union[dict, List[dict]] = None,
+        predicates: Optional[Predicate] = None,
+        labels: Union[str, List[str], None] = None,
+        time_range: Optional[Tuple[datetime, datetime]] = None,
+        candidates: int = 20,
+        rrf_k: int = 60,
+        return_dataframe: bool = True,
+    ) -> Union[List[Tuple[Any, ...]], pd.DataFrame]:
+        """
+        Combine semantic (vector) search with BM25 keyword search.
+
+        Each search returns its top `candidates` rows. The two rankings are
+        merged with Reciprocal Rank Fusion: score = sum of 1 / (rrf_k + rank).
+        A row found by both searches ranks highest. Keyword search catches
+        exact terms (product names, error codes) that embeddings can miss.
+
+        Takes the same filters as search(). Needs the pg_textsearch extension.
+
+        Returns:
+            Columns: id, content, score, semantic_rank, keyword_rank, plus
+            metadata columns. A rank is empty when that search didn't find the row.
+        """
+        columns = ["id", "metadata", "content", "score", "semantic_rank", "keyword_rank"]
+        query_embedding = np.asarray(self.get_embedding(query_text), dtype=np.float32)
+
+        start_time = time.time()
+        where = self._where_clause(metadata_filter, predicates, labels, time_range)
+        if where is None:
+            rows = []
+        else:
+            where_sql, where_params = where
+            query = sql.SQL(
+                """
+                WITH semantic AS (
+                    SELECT id, row_number() OVER (ORDER BY distance) AS rank
+                    FROM (
+                        SELECT id, embedding <=> %s AS distance
+                        FROM {table}
+                        {where}
+                        ORDER BY embedding <=> %s
+                        LIMIT %s
+                    ) AS s
+                ),
+                keyword AS (
+                    -- <@> returns negative BM25 scores: lower is a better match
+                    SELECT id, row_number() OVER (ORDER BY bm25) AS rank
+                    FROM (
+                        SELECT id, contents <@> to_bm25query(%s, %s) AS bm25
+                        FROM {table}
+                        {where}
+                        ORDER BY contents <@> to_bm25query(%s, %s)
+                        LIMIT %s
+                    ) AS k
+                    WHERE bm25 < 0  -- drop rows that share no terms with the query
+                )
+                SELECT t.id, t.metadata, t.contents,
+                       (COALESCE(1.0 / (%s + semantic.rank), 0)
+                         + COALESCE(1.0 / (%s + keyword.rank), 0))::float8 AS score,
+                       semantic.rank, keyword.rank
+                FROM semantic
+                FULL OUTER JOIN keyword USING (id)
+                JOIN {table} AS t USING (id)
+                ORDER BY score DESC
+                LIMIT %s
+                """
+            ).format(table=self._table, where=where_sql)
+            bm25_index = f"{self.table_name}_contents_bm25_idx"
+            params = [
+                query_embedding, *where_params, query_embedding, candidates,
+                query_text, bm25_index, *where_params, query_text, bm25_index, candidates,
+                rrf_k, rrf_k, limit,
+            ]
+            rows = self.conn.execute(query, params).fetchall()
+        elapsed_time = time.time() - start_time
+
+        logging.info(f"Hybrid search completed in {elapsed_time:.3f} seconds")
+
+        if return_dataframe:
+            return self._create_dataframe_from_results(rows, columns)
+        return rows
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _where_clause(
+        self,
+        metadata_filter: Union[dict, List[dict], None],
+        predicates: Optional[Predicate],
+        labels: Union[str, List[str], None],
+        time_range: Optional[Tuple[datetime, datetime]],
+    ) -> Optional[Tuple[sql.Composable, List[Any]]]:
+        """Build the WHERE clause. Returns None when no row can match."""
+        conditions: List[sql.Composable] = []
+        params: List[Any] = []
+
+        if metadata_filter:
+            filters = metadata_filter if isinstance(metadata_filter, list) else [metadata_filter]
+            conditions.append(
+                sql.SQL("({})").format(
+                    sql.SQL(" OR ").join(sql.SQL("metadata @> %s") for _ in filters)
+                )
+            )
+            params.extend(Jsonb(f) for f in filters)
+
+        if predicates:
+            condition, predicate_params = predicates.to_sql()
+            conditions.append(condition)
+            params.extend(predicate_params)
+
+        if labels:
+            label_ids = self._get_label_ids(_as_list(labels))
+            if not label_ids:
+                return None  # none of these labels exist yet
+            conditions.append(sql.SQL("labels && %s::smallint[]"))
+            params.append(list(label_ids.values()))
+
+        if time_range:
+            start_date, end_date = time_range
+            conditions.append(sql.SQL("id >= %s AND id < %s"))
+            params.extend([uuid7_lower_bound(start_date), uuid7_lower_bound(end_date)])
+
+        if not conditions:
+            return sql.SQL(""), []
+        return sql.SQL("WHERE ") + sql.SQL(" AND ").join(conditions), params
+
+    def _get_label_ids(self, names: Iterable[str], create: bool = False) -> Dict[str, int]:
+        """Map label names to their smallint ids, optionally creating missing ones."""
+        names = sorted({str(n) for n in names if n})
+        if not names:
+            return {}
+        if create:
+            self.conn.execute(
+                sql.SQL(
+                    """
+                    INSERT INTO {labels} (name)
+                    SELECT n FROM unnest(%s::text[]) AS n
+                    WHERE n NOT IN (SELECT name FROM {labels})
+                    ON CONFLICT (name) DO NOTHING
+                    """
+                ).format(labels=self._labels_table),
+                [names],
+            )
+        rows = self.conn.execute(
+            sql.SQL("SELECT name, id FROM {} WHERE name = ANY(%s)").format(self._labels_table),
+            [names],
+        ).fetchall()
+        return dict(rows)
+
+    @staticmethod
+    def _create_dataframe_from_results(
+        rows: List[Tuple[Any, ...]],
+        columns: List[str],
+    ) -> pd.DataFrame:
+        """
+        Create a pandas DataFrame from the search results, with one column per
+        metadata key.
+        """
+        df = pd.DataFrame(rows, columns=columns)
+        metadata = pd.DataFrame(df.pop("metadata").tolist(), index=df.index)
+        df = pd.concat([df, metadata], axis=1)
+
+        # Convert id to string for better readability
+        df["id"] = df["id"].astype(str)
+
+        return df
+
+
+def _as_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return [value]
